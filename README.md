@@ -1,4 +1,4 @@
-# JSthon ![version](https://img.shields.io/badge/version-1.1.0-yellow)
+# JSthon ![version](https://img.shields.io/badge/version-2.0.0-yellow)
 
 JSthon is a lightweight Python interpreter written in JavaScript that runs directly in the browser. It features a custom lexical tokenizer and an environment-based scoping system to mimic Python's execution model.
 
@@ -22,7 +22,8 @@ Integrate JSthon into any web project with just a few lines of HTML:
 - **Lists:** Support for concatenation (`+`), indexing, and slicing.
 - **F-Strings:** Python string interpolation (e.g., `f"Value: {x}"`).
 - **Interactive:** Built-in `input()` function with inline prompts.
-- **Attributes** Many attributes are now supported (e.g., `.upper()`, `.len()`, `.append()`)
+- **Attributes:** Many attributes are now supported (e.g., `.upper()`, `.len()`, `.append()`)
+- **Errors:** Python style tracebacks.
 
 ### Architecture
 JSthon operates in three main stages:
@@ -30,7 +31,7 @@ JSthon operates in three main stages:
 2. **Environment:** A recursive tree structure managing variable bindings and scope inheritance.
 3. **Evaluator:** An asynchronous engine handling blocks, function calls, and operator precedence.
 
-### Example Syntax
+### Example Script
 ```python
 def make_counter(n):
     count = n
@@ -51,9 +52,7 @@ print(f"Next value: {counter()}")
 - **Modules:** A system to `import` external JSthon scripts.
 
 ### Version Notation
-`x.0.0`: Major releases  Blue badge \
-`0.x.0`: Minor releases - Yellow badge \
-`0.0.x`: Patches - Red badge
+`Major.Minor.Patch`
 
 
 ### License

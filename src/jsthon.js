@@ -1,4 +1,8 @@
-// --- JSthon ---
+// --- Pyrite v2.0.0  ---
+
+// =========================================================
+// ENVIRONMENT
+// =========================================================
 class Environment {
     constructor(parent = null, isFunctionScope = false) {
         this.variables = {};
@@ -36,14 +40,66 @@ class Environment {
     }
 }
 
+// =========================================================
+// CONSTANTS
+// =========================================================
+
+// --- Pre-compiled regex constants ---
+const RE_WHITESPACE       = /\s/;
+const RE_DIGIT            = /\d/;
+const RE_DIGIT_OR_DOT     = /[\d.]/;
+const RE_IDENT_START      = /[a-zA-Z_]/;
+const RE_IDENT_CHAR       = /\w/;
+const RE_FSTRING_START    = /^f["']/;
+const RE_FSTRING_TOKEN    = /^["']/;
+const RE_INDENT           = /^(\s*)/;
+const RE_GLOBAL           = /^global\s+/;
+const RE_NONLOCAL         = /^nonlocal\s+/;
+const RE_DEF              = /^def\s+[a-zA-Z_]\w*\s*\(.*\)\s*:$/;
+const RE_DEF_PARTS        = /^def\s+([a-zA-Z_]\w*)\s*\((.*)\)\s*:$/;
+const RE_IF               = /^if .+:$/;
+const RE_IF_CHAIN         = /^(if|elif|else)\s*(.*?):$/;
+const RE_FOR_WHILE        = /^(for |while )/;
+const RE_FOR_PARTS        = /^for\s+(.+?)\s+in\s+(.+):$/;
+const RE_WHILE_COND       = /^while\s+(.+):$/;
+const RE_METHOD_CALL      = /^([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\((.*)\)$/s;
+const RE_FUNC_CALL        = /^[a-zA-Z_]\w*\s*\(/;
+const RE_DOT_ACCESS       = /^[a-zA-Z_]\w*\./;
+const RE_IDENT_ONLY       = /^[a-zA-Z_]\w*$/;
+const RE_BLOCK_HEADER     = /^(if |elif |else\s*:|for |while |def )/;
+const RE_TUPLE_ASSIGN     = /^([a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)+)\s*=(?!=)\s*(.+)$/s;
+const RE_ASSIGN           = /^([a-zA-Z_]\w*(?:\[.*?\])?)\s*(\+|-|\*|\/)?=(?!=)\s*(.*)$/s;
+const RE_RETURN           = /^return/;
+const RE_TWO_CHAR_OPS     = new Set(['==','!=','>=','<=','//','+=','-=','**','*=','/=']);
+const RE_NAN_CHECK        = /^-?\d+\.?\d*$/;
+
+// Tokenizer cache
+const tokenCache = new Map();
+const TOKEN_CACHE_MAX = 2000;
+
+// Python builtin names
+const BUILTIN_NAMES = new Set([
+    'abs','all','any','ascii','bin','bool','bytearray','bytes','callable','chr',
+    'classmethod','compile','complex','delattr','dict','dir','divmod','enumerate',
+    'eval','exec','filter','float','format','frozenset','getattr','globals','hasattr',
+    'hash','help','hex','id','input','int','isinstance','issubclass','iter','len',
+    'list','locals','map','max','memoryview','min','next','object','oct','ord','pow',
+    'print','property','range','repr','reversed','round','set','setattr','slice',
+    'sorted','staticmethod','str','sum','super','tuple','type','vars','zip','__import__'
+]);
+
+// =========================================================
+// RUNTIME
+// =========================================================
 async function runCompiler() {
+
     const editor = document.getElementById('editor');
     const consoleDiv = document.getElementById('console');
     const code = editor.value;
     consoleDiv.innerText = '';
     const globalEnv = new Environment();
 
-    // --- helpers ---
+    // --- value helpers ---
 
     function pyRepr(v) {
         if (v === null) return 'None';
@@ -68,7 +124,6 @@ async function runCompiler() {
         return String(v);
     }
 
-    // Python str() of a value (no quotes on strings)
     function pyStr(v) {
         if (v === null) return 'None';
         if (v === true) return 'True';
@@ -77,7 +132,6 @@ async function runCompiler() {
         return pyRepr(v);
     }
 
-    /// Truthiness matching
     function pyBool(v) {
         if (v === null || v === false || v === 0 || v === 0n) return false;
         if (typeof v === 'string' && v.length === 0) return false;
@@ -92,7 +146,6 @@ async function runCompiler() {
 
     function wrap(value, type) { return { value, type }; }
 
-    // Iterate anything iterable 
     function iterValues(obj) {
         if (Array.isArray(obj)) return obj;
         if (typeof obj === 'string') return [...obj];
@@ -100,7 +153,7 @@ async function runCompiler() {
             if (obj.__type__ === 'tuple' || obj.__type__ === 'list_view') return obj.data;
             if (obj.__type__ === 'set' || obj.__type__ === 'frozenset') return [...obj.data];
             if (obj.__type__ === 'dict') return Object.keys(obj.data).map(k => isNaN(k) ? k : Number(k));
-            if (obj.stop !== undefined) { // range
+            if (obj.stop !== undefined) {
                 const vals = [];
                 const { start, stop, step } = obj;
                 if (step > 0) { for (let v = start; v < stop; v += step) vals.push(v); }
@@ -111,16 +164,23 @@ async function runCompiler() {
         throw new Error(`TypeError: object is not iterable`);
     }
 
-    async function callFunction(fnObj, args, env) {
+    // --- function call dispatcher ---
+    async function callFunction(fnObj, args, env, kwargs = {}) {
         if (fnObj.type === 'builtin') return await fnObj.value(args);
         if (fnObj.type !== 'func') throw new Error(`TypeError: object is not callable`);
         const { params, body: fnBody, closure } = fnObj.value;
         const fnEnv = new Environment(closure, true);
         for (let pi = 0; pi < params.length; pi++) {
             const { name: pname, defaultExpr } = params[pi];
-            if (pi < args.length) fnEnv.set(pname, args[pi]);
-            else if (defaultExpr !== null) fnEnv.set(pname, await evaluate(defaultExpr, closure));
-            else throw new Error(`TypeError: missing required argument '${pname}'`);
+            if (pname in kwargs) {
+                fnEnv.set(pname, kwargs[pname]);
+            } else if (pi < args.length) {
+                fnEnv.set(pname, args[pi]);
+            } else if (defaultExpr !== null) {
+                fnEnv.set(pname, await evaluate(defaultExpr, closure));
+            } else {
+                throw new Error(`TypeError: missing required argument '${pname}'`);
+            }
         }
         try {
             await executeBlock(fnBody, fnEnv);
@@ -131,27 +191,180 @@ async function runCompiler() {
         }
     }
 
+    // --- Console output ---
     function outputToConsole(text) {
-        const line = document.createElement('div');
-        if (Array.isArray(text)) {
-            line.textContent = text.map(item => typeof item === 'string' ? item : pyStr(item)).join(' ');
-        } else {
-            line.textContent = pyStr(text);
+        const content = Array.isArray(text)
+            ? text.map(item => typeof item === 'string' ? item : pyStr(item)).join(' ')
+            : pyStr(text);
+        const parts = content.split('\n');
+        for (const part of parts) {
+            const line = document.createElement('div');
+            line.style.whiteSpace = 'pre';
+            line.textContent = part;
+            consoleDiv.appendChild(line);
         }
-        consoleDiv.appendChild(line);
     }
 
+    // --- Unescape ---
+    function unescapeString(s) {
+        return s
+            .replace(/\\n/g, '\n')
+            .replace(/\\t/g, '\t')
+            .replace(/\\r/g, '\r')
+            .replace(/\\'/g, "'")
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\')
+            .replace(/\\0/g, '\0');
+    }
+
+    // --- Python traceback formatter ---
+    function formatTraceback(srcLine, lineText, errorMsg) {
+        // Extract the error type and message
+        const colonIdx = errorMsg.indexOf(':');
+        const errType = colonIdx !== -1 ? errorMsg.slice(0, colonIdx).trim() : 'Error';
+        const errMsg  = colonIdx !== -1 ? errorMsg.slice(colonIdx + 1).trim() : errorMsg;
+
+        const file = '<pyrite>';
+        let out = `Traceback (most recent call last):\n`;
+        out += `  File "${file}", line ${srcLine}, in <module>\n`;
+
+        if (lineText) {
+            const stripped = lineText.trim();
+            out += `    ${stripped}\n`;
+
+            // Try to underline the offending token
+            const nameMatch = errorMsg.match(/name '([^']+)'/);
+            const attrMatch = errorMsg.match(/attribute '([^']+)'/);
+            const token = (nameMatch || attrMatch)?.[1] ?? null;
+
+            if (token) {
+                const tokenIdx = stripped.indexOf(token);
+                if (tokenIdx !== -1) {
+                    out += `    ${' '.repeat(tokenIdx)}${'~'.repeat(Math.max(1, token.length - 1))}^${'~'.repeat(0)}\n`;
+                } else {
+                    out += `    ^\n`;
+                }
+            } else {
+                // generic underline
+                out += `    ^\n`;
+            }
+        }
+
+        out += `${errType}: ${errMsg}`;
+        return out;
+    }
+
+    // --- Tokenizer ---
     function tokenize(expr) {
-        const regex = /"(?:\\"|[^"])*"|'(?:\\'|[^'])*'|\d+\.\d+|\d+|[a-zA-Z_]\w*|==|!=|>=|<=|\/\/|\+=|-=|[+\-*/%()<>!=,\[\]]/g;
-        return expr.match(regex) || [];
+        if (tokenCache.has(expr)) return tokenCache.get(expr).slice();
+
+        const tokens = [];
+        let i = 0;
+        const s = expr;
+
+        while (i < s.length) {
+            if (RE_WHITESPACE.test(s[i])) { i++; continue; }
+
+            // f-strings
+            if ((s[i] === 'f' || s[i] === 'F') && (s[i+1] === '"' || s[i+1] === "'")) {
+                const q = s[i+1];
+                let token = 'f' + q;
+                let j = i + 2;
+                if (s[j] === q && s[j+1] === q) {
+                    token += q + q; j += 2;
+                    while (j < s.length) {
+                        if (s[j] === q && s[j+1] === q && s[j+2] === q) { token += q + q + q; j += 3; break; }
+                        token += s[j++];
+                    }
+                } else {
+                    while (j < s.length && s[j] !== q) {
+                        if (s[j] === '\\') { token += s[j] + (s[j+1] || ''); j += 2; }
+                        else token += s[j++];
+                    }
+                    token += q; j++;
+                }
+                tokens.push(token);
+                i = j;
+                continue;
+            }
+
+            // triple-quoted strings
+            if ((s[i] === '"' || s[i] === "'") && s[i+1] === s[i] && s[i+2] === s[i]) {
+                const q = s[i];
+                let token = q + q + q;
+                let j = i + 3;
+                while (j < s.length) {
+                    if (s[j] === q && s[j+1] === q && s[j+2] === q) { token += q + q + q; j += 3; break; }
+                    if (s[j] === '\\') { token += s[j] + (s[j+1] || ''); j += 2; }
+                    else token += s[j++];
+                }
+                tokens.push(token);
+                i = j;
+                continue;
+            }
+
+            // regular strings
+            if (s[i] === '"' || s[i] === "'") {
+                const q = s[i];
+                let token = q;
+                let j = i + 1;
+                while (j < s.length && s[j] !== q) {
+                    if (s[j] === '\\') { token += s[j] + (s[j+1] || ''); j += 2; }
+                    else token += s[j++];
+                }
+                token += q; j++;
+                tokens.push(token);
+                i = j;
+                continue;
+            }
+
+            // numbers
+            if (RE_DIGIT.test(s[i]) || (s[i] === '.' && RE_DIGIT.test(s[i+1]))) {
+                let token = '';
+                while (i < s.length && RE_DIGIT_OR_DOT.test(s[i])) token += s[i++];
+                tokens.push(token);
+                continue;
+            }
+
+            // identifiers / keywords
+            if (RE_IDENT_START.test(s[i])) {
+                let token = '';
+                while (i < s.length && RE_IDENT_CHAR.test(s[i])) token += s[i++];
+                tokens.push(token);
+                continue;
+            }
+
+            // two-char operators
+            if (i + 1 < s.length && RE_TWO_CHAR_OPS.has(s[i]+s[i+1])) {
+                tokens.push(s[i]+s[i+1]); i += 2; continue;
+            }
+
+            tokens.push(s[i++]);
+        }
+
+        if (tokenCache.size >= TOKEN_CACHE_MAX) {
+            tokenCache.delete(tokenCache.keys().next().value);
+        }
+        tokenCache.set(expr, tokens.slice());
+        return tokens;
     }
 
+    // --- f-string resolver ---
     async function resolveFString(raw, env) {
-        const inner = raw.slice(2, -1);
+        let inner = raw.slice(1);
+        if (inner.startsWith('"""') || inner.startsWith("'''")) {
+            inner = inner.slice(3, -3);
+        } else {
+            inner = inner.slice(1, -1);
+        }
+        inner = inner.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r');
+
         let result = '';
         let i = 0;
         while (i < inner.length) {
             if (inner[i] === '{') {
+                // Check for {{ escape
+                if (inner[i+1] === '{') { result += '{'; i += 2; continue; }
                 let depth = 1, j = i + 1;
                 while (j < inner.length && depth > 0) {
                     if (inner[j] === '{') depth++;
@@ -162,6 +375,8 @@ async function runCompiler() {
                 const val = await evaluate(exprStr, env);
                 result += pyStr(val.value);
                 i = j;
+            } else if (inner[i] === '}' && inner[i+1] === '}') {
+                result += '}'; i += 2;
             } else {
                 result += inner[i++];
             }
@@ -169,7 +384,7 @@ async function runCompiler() {
         return wrap(result, 'str');
     }
 
-    // --- parser ---
+    // --- parser helpers ---
     function parseParams(paramStr) {
         const params = [];
         let cur = '', depth = 0, inStr = false, strChar = '';
@@ -193,20 +408,45 @@ async function runCompiler() {
         return params;
     }
 
-    // --- built-in function table ---
+    async function parseCallArgs(argsRaw, env) {
+        const positional = [];
+        const kwargs = {};
+        let sub = [], bal = 0, inStr = false, sc = '';
+        const parts = [];
+        for (let ci = 0; ci < argsRaw.length; ci++) {
+            const c = argsRaw[ci];
+            if (inStr) { sub.push(c); if (c === sc) inStr = false; continue; }
+            if (c === '"' || c === "'") { inStr = true; sc = c; sub.push(c); continue; }
+            if (c === '(' || c === '[') { bal++; sub.push(c); continue; }
+            if (c === ')' || c === ']') { bal--; sub.push(c); continue; }
+            if (c === ',' && bal === 0) { parts.push(sub.join('')); sub = []; continue; }
+            sub.push(c);
+        }
+        if (sub.length) parts.push(sub.join(''));
+
+        for (const part of parts) {
+            const t = part.trim();
+            if (!t) continue;
+            const kwMatch = t.match(/^([a-zA-Z_]\w*)\s*=(?!=)\s*(.+)$/);
+            if (kwMatch) {
+                kwargs[kwMatch[1]] = await evaluate(kwMatch[2], env);
+            } else {
+                positional.push(await evaluate(t, env));
+            }
+        }
+        return { positional, kwargs };
+    }
+
+    // --- Builtins built once per run ---
     function makeBuiltins(env, globalEnv) {
-        // gets a "key function"
         const B = {};
 
         // abs
         B.abs = async ([a]) => wrap(Math.abs(a.value), a.type);
-
         // all
         B.all = async ([it]) => wrap(iterValues(it.value).every(v => pyBool(v)), 'bool');
-
         // any
         B.any = async ([it]) => wrap(iterValues(it.value).some(v => pyBool(v)), 'bool');
-
         // ascii
         B.ascii = async ([a]) => {
             const s = pyRepr(a.value).replace(/[^\x00-\x7F]/g, c => {
@@ -215,16 +455,13 @@ async function runCompiler() {
             });
             return wrap(s, 'str');
         };
-
         // bin
         B.bin = async ([a]) => wrap('0b' + (a.value >>> 0).toString(2), 'str');
-
         // bool
         B.bool = async ([a]) => {
             if (!a) return wrap(false, 'bool');
             return wrap(pyBool(a.value), 'bool');
         };
-
         // bytearray
         B.bytearray = async ([a]) => {
             let data;
@@ -235,7 +472,6 @@ async function runCompiler() {
             else data = new Uint8Array(iterValues(a.value));
             return wrap({ __type__: 'bytearray', data }, 'bytearray');
         };
-
         // bytes
         B.bytes = async ([a]) => {
             let data;
@@ -245,38 +481,28 @@ async function runCompiler() {
             else data = new Uint8Array(iterValues(a.value));
             return wrap({ __type__: 'bytes', data }, 'bytes');
         };
-
         // callable
         B.callable = async ([a]) => wrap(a && (a.type === 'func' || a.type === 'builtin'), 'bool');
-
         // chr
         B.chr = async ([a]) => wrap(String.fromCodePoint(a.value), 'str');
-
-        // classmethod – for later support
+        // classmethod - not supported yet
         B.classmethod = async ([a]) => a;
-
-        // compile – for later support
+        // compile
         B.compile = async ([src, filename, mode]) => wrap({ __type__: 'code', src: src.value, filename: filename?.value, mode: mode?.value }, 'code');
-
         // complex
         B.complex = async ([re, im]) => {
             const r = re ? Number(re.value) : 0;
             const i = im ? Number(im.value) : 0;
             return wrap({ __type__: 'complex', real: r, imag: i }, 'complex');
         };
-
-        // delattr – for later support
+        // delattr
         B.delattr = async ([obj, name]) => {
             if (obj.value && typeof obj.value === 'object') delete obj.value[name.value];
             return wrap(null, 'None');
         };
-
-        // dict
-        B.dict = async (args) => {
-            return wrap({ __type__: 'dict', data: {} }, 'dict');
-        };
-
-        // dir
+        // dict - somewhat supported
+        B.dict = async (args) => wrap({ __type__: 'dict', data: {} }, 'dict');
+        // dir - somewhat supported
         B.dir = async ([a]) => {
             let keys = [];
             if (!a || a.value === null) keys = [];
@@ -285,32 +511,27 @@ async function runCompiler() {
             else if (typeof a.value === 'string') keys = ['capitalize','center','count','encode','endswith','find','format','index','isalnum','isalpha','isdigit','islower','isupper','join','lower','lstrip','replace','rfind','rindex','rsplit','rstrip','split','startswith','strip','title','upper','zfill'];
             return wrap(keys, 'list');
         };
-
         // divmod
         B.divmod = async ([a, b]) => {
             const q = Math.floor(a.value / b.value);
             const r = ((a.value % b.value) + b.value) % b.value;
             return wrap({ __type__: 'tuple', data: [q, r] }, 'tuple');
         };
-
-        // enumerate
+        // enumerate - somewhat supported
         B.enumerate = async ([it, start]) => {
             const vals = iterValues(it.value);
             const s = start ? start.value : 0;
             return wrap(vals.map((v, i) => ({ __type__: 'tuple', data: [i + s, v] })), 'list');
         };
-
-        // eval
+        // eval - somewhat supported
         B.eval = async ([src]) => await evaluate(src.value.trim(), env);
-
-        // exec
+        // exec - somewhat supported
         B.exec = async ([src]) => {
             const lines = src.value.split('\n').map((t, i) => tagLine(t, i + 1));
             await executeBlock(lines, env, 1);
             return wrap(null, 'None');
         };
-
-        // filter
+        // filter - somewhat supported
         B.filter = async ([fn, it]) => {
             const vals = iterValues(it.value);
             const result = [];
@@ -320,11 +541,8 @@ async function runCompiler() {
             }
             return wrap(result, 'list');
         };
-
-        // float
         B.float = async ([a]) => wrap(parseFloat(a.value), 'float');
-
-        // format
+        // format - somewhat supported
         B.format = async ([val, spec]) => {
             const s = spec ? spec.value : '';
             let v = val.value;
@@ -347,13 +565,11 @@ async function runCompiler() {
             }
             return wrap(out, 'str');
         };
-
         // frozenset
         B.frozenset = async ([it]) => {
             const vals = it ? iterValues(it.value) : [];
             return wrap({ __type__: 'frozenset', data: new Set(vals) }, 'frozenset');
         };
-
         // getattr
         B.getattr = async ([obj, name, def]) => {
             try {
@@ -365,20 +581,17 @@ async function runCompiler() {
                 throw new Error(`AttributeError: object has no attribute '${name.value}'`);
             } catch(e) { if (def) return def; throw e; }
         };
-
         // globals
         B.globals = async () => {
             const data = {};
             for (const [k, v] of Object.entries(globalEnv.variables)) data[k] = v.value;
             return wrap({ __type__: 'dict', data }, 'dict');
         };
-
         // hasattr
         B.hasattr = async ([obj, name]) => {
             try { await B.getattr([obj, name]); return wrap(true, 'bool'); }
             catch { return wrap(false, 'bool'); }
         };
-
         // hash
         B.hash = async ([a]) => {
             const s = pyRepr(a.value);
@@ -386,24 +599,20 @@ async function runCompiler() {
             for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
             return wrap(h, 'int');
         };
-
         // help
         B.help = async ([a]) => {
-            outputToConsole(a ? `Help for: ${pyRepr(a.value)}` : 'JSthon built-in help system');
+            outputToConsole(a ? `Help for: ${pyRepr(a.value)}` : 'Pyrite built-in help system');
             return wrap(null, 'None');
         };
-
         // hex
         B.hex = async ([a]) => wrap('0x' + (a.value >>> 0).toString(16), 'str');
-
-        // id
+        // id - not fully supported yet
         B.id = async ([a]) => {
             if (!a.value?.__id__) {
                 if (a.value && typeof a.value === 'object') a.value.__id__ = Math.floor(Math.random() * 2**32);
             }
             return wrap(a.value?.__id__ ?? 0, 'int');
         };
-
         // input
         B.input = async ([promptArg]) => {
             const promptText = promptArg ? String(promptArg.value) : '';
@@ -423,31 +632,38 @@ async function runCompiler() {
             });
             return wrap(userValue, 'str');
         };
-
         // int
         B.int = async ([a, base]) => {
             if (base) return wrap(parseInt(String(a.value), base.value), 'int');
             return wrap(typeof a.value === 'string' ? parseInt(a.value, 10) : Math.trunc(a.value), 'int');
         };
-
-        // isinstance – currently supports strings. a patch will release soon
+        // isinstance
         B.isinstance = async ([obj, cls]) => {
-            const t = obj.type;
-            const cn = typeof cls.value === 'string' ? cls.value : cls.value?.name ?? '';
-            const typeMap = { int:'int',float:'float',str:'str',bool:'bool',list:'list',dict:'dict',tuple:'tuple',set:'set',bytes:'bytes',complex:'complex' };
-            return wrap(t === typeMap[cn] || (cn === 'bool' && t === 'bool'), 'bool');
+            const cn = cls?.value?.__typeName__ ?? '';
+            const typeMap = {
+                int: v => v.type === 'int' || (v.type === 'bool'),
+                float: v => v.type === 'float' || v.type === 'int',
+                str: v => v.type === 'str',
+                bool: v => v.type === 'bool',
+                list: v => Array.isArray(v.value) && v.type !== 'bool',
+                dict: v => v.value?.__type__ === 'dict',
+                tuple: v => v.value?.__type__ === 'tuple',
+                set: v => v.value?.__type__ === 'set',
+                frozenset: v => v.value?.__type__ === 'frozenset',
+                bytes: v => v.value?.__type__ === 'bytes',
+                complex: v => v.value?.__type__ === 'complex',
+            };
+            if (cn in typeMap) return wrap(typeMap[cn](obj), 'bool');
+            return wrap(false, 'bool');
         };
-
-        // issubclass – for later support
+        // issubclass - not supported yet
         B.issubclass = async ([sub, sup]) => wrap(false, 'bool');
-
         // iter
         B.iter = async ([it]) => {
             const vals = iterValues(it.value);
             let idx = 0;
             return wrap({ __type__: 'iterator', next: () => idx < vals.length ? { done: false, value: vals[idx++] } : { done: true } }, 'iterator');
         };
-
         // len
         B.len = async ([a]) => {
             if (Array.isArray(a.value)) return wrap(a.value.length, 'int');
@@ -457,20 +673,17 @@ async function runCompiler() {
             if (a.value?.__type__ === 'tuple') return wrap(a.value.data.length, 'int');
             throw new Error(`TypeError: object of type '${a.type}' has no len()`);
         };
-
         // list
         B.list = async ([it]) => {
             if (!it) return wrap([], 'list');
-            return wrap(iterValues(`${it.value}`), 'list');
+            return wrap(iterValues(it.value), 'list');
         };
-
         // locals
         B.locals = async () => {
             const data = {};
             for (const [k, v] of Object.entries(env.variables)) data[k] = v.value;
             return wrap({ __type__: 'dict', data }, 'dict');
         };
-
         // map
         B.map = async ([fn, ...iters]) => {
             const arrays = iters.map(it => iterValues(it.value));
@@ -482,24 +695,20 @@ async function runCompiler() {
             }
             return wrap(result, 'list');
         };
-
         // max
         B.max = async (args) => {
             let vals = args.length === 1 ? iterValues(args[0].value) : args.map(a => a.value);
             if (vals.length === 0) throw new Error('ValueError: max() arg is an empty sequence');
             return wrap(vals.reduce((a, b) => a > b ? a : b), 'obj');
         };
-
-        // memoryview – for later support
+        // memoryview - not fully supported yet
         B.memoryview = async ([a]) => wrap({ __type__: 'memoryview', data: a.value }, 'memoryview');
-
         // min
         B.min = async (args) => {
             let vals = args.length === 1 ? iterValues(args[0].value) : args.map(a => a.value);
             if (vals.length === 0) throw new Error('ValueError: min() arg is an empty sequence');
             return wrap(vals.reduce((a, b) => a < b ? a : b), 'obj');
         };
-
         // next
         B.next = async ([it, def]) => {
             if (it.value?.__type__ === 'iterator') {
@@ -509,70 +718,57 @@ async function runCompiler() {
             }
             throw new Error(`TypeError: '${it.type}' object is not an iterator`);
         };
-
-        // object – for later support
+        // object - not supported yet
         B.object = async () => wrap({ __type__: 'object' }, 'object');
-
         // oct
         B.oct = async ([a]) => wrap('0o' + (a.value >>> 0).toString(8), 'str');
-
         // ord
         B.ord = async ([a]) => {
             if (typeof a.value !== 'string' || a.value.length !== 1) throw new Error(`TypeError: ord() expected a character`);
             return wrap(a.value.codePointAt(0), 'int');
         };
-
-        // pow
+        // pow with optional modulus
         B.pow = async ([base, exp, mod]) => {
             const r = Math.pow(base.value, exp.value);
             return wrap(mod ? ((r % mod.value) + mod.value) % mod.value : r, 'num');
         };
-
         // print
         B.print = async (args) => {
             outputToConsole(args.map(a => a.value));
             return wrap(null, 'None');
         };
-
-        // property – for later support
-        B.property = async ([fget, fset, fdel, doc]) => {
-            return wrap({ __type__: 'property', fget: fget?.value, fset: fset?.value, fdel: fdel?.value }, 'property');
-        };
-
+        // property
+        B.property = async ([fget, fset, fdel, doc]) => wrap({ __type__: 'property', fget: fget?.value, fset: fset?.value, fdel: fdel?.value }, 'property');
         // range
         B.range = async (args) => {
-            let start, stop, step;
-            if (args.length === 1) { start = 0; stop = args[0].value; step = 1; }
-            else if (args.length === 2) { start = args[0].value; stop = args[1].value; step = 1; }
-            else { start = args[0].value; stop = args[1].value; step = args[2].value; }
+            if (args.length === 0) throw new Error("TypeError: range expected at least 1 argument, got 0");
+            let start = 0, stop, step = 1;
+            if (args.length === 1) { stop = args[0].value; }
+            else if (args.length === 2) { start = args[0].value; stop = args[1].value; }
+            else if (args.length === 3) { start = args[0].value; stop = args[1].value; step = args[2].value; }
+            else throw new Error(`TypeError: range expected at most 3 arguments, got ${args.length}`);
             return wrap({ start, stop, step }, 'range');
         };
-
         // repr
         B.repr = async ([a]) => wrap(pyRepr(a.value), 'str');
-
         // reversed
         B.reversed = async ([it]) => wrap([...iterValues(it.value)].reverse(), 'list');
-
         // round
         B.round = async ([num, ndigits]) => {
             if (!ndigits) return wrap(Math.round(num.value), 'int');
             const factor = Math.pow(10, ndigits.value);
             return wrap(Math.round(num.value * factor) / factor, 'float');
         };
-
         // set
         B.set = async ([it]) => {
             const vals = it ? iterValues(it.value) : [];
             return wrap({ __type__: 'set', data: new Set(vals) }, 'set');
         };
-
         // setattr
         B.setattr = async ([obj, name, val]) => {
             if (obj.value && typeof obj.value === 'object') obj.value[name.value] = val.value;
             return wrap(null, 'None');
         };
-
         // slice
         B.slice = async (args) => {
             let start = null, stop = null, step = null;
@@ -581,7 +777,6 @@ async function runCompiler() {
             else { start = args[0].value; stop = args[1].value; step = args[2].value; }
             return wrap({ __type__: 'slice', start, stop, step }, 'slice');
         };
-
         // sorted
         B.sorted = async ([it, key, reverse]) => {
             const vals = [...iterValues(it.value)];
@@ -596,46 +791,32 @@ async function runCompiler() {
             if (reverse && reverse.value) vals.reverse();
             return wrap(vals, 'list');
         };
-
-        // staticmethod – for later support
+        // staticmethod - not supported yet
         B.staticmethod = async ([a]) => a;
-
         // str
         B.str = async ([a]) => wrap(a ? pyStr(a.value) : '', 'str');
-
         // sum
         B.sum = async ([it, start]) => {
             const vals = iterValues(it.value);
             const s = start ? start.value : 0;
             return wrap(vals.reduce((acc, v) => acc + v, s), 'num');
         };
-
-        // super – for later support
+        // super
         B.super = async () => wrap({ __type__: 'super' }, 'super');
-
         // tuple
         B.tuple = async ([it]) => {
             const vals = it ? iterValues(it.value) : [];
             return wrap({ __type__: 'tuple', data: vals }, 'tuple');
         };
-
         // type
         B.type = async ([a]) => {
             const pyType = (name) => wrap(`<class '${name}'>`, 'str');
-
             if (!a || a.value === null) return pyType('NoneType');
-            
             if (typeof a.value === 'boolean') return pyType('bool');
-            
-            if (a.value && typeof a.value === 'object' && a.value.__type__) {
-                return pyType(a.value.__type__);
-            }
-            
+            if (a.value && typeof a.value === 'object' && a.value.__type__) return pyType(a.value.__type__);
             if (Array.isArray(a.value)) return pyType('list');
-            
             return pyType(a.type);
         };
-
         // vars
         B.vars = async ([a]) => {
             if (!a) return B.locals([]);
@@ -646,7 +827,6 @@ async function runCompiler() {
             }
             throw new Error("TypeError: vars() argument must have __dict__ attribute");
         };
-
         // zip
         B.zip = async (args) => {
             if (args.length === 0) return wrap([], 'list');
@@ -656,8 +836,7 @@ async function runCompiler() {
             for (let i = 0; i < len; i++) result.push({ __type__: 'tuple', data: arrays.map(a => a[i]) });
             return wrap(result, 'list');
         };
-
-        // __import__ – for later support
+        // import - not supported yet
         B.__import__ = async ([name]) => {
             throw new Error(`ImportError: No module named '${name.value}' (import not supported yet)`);
         };
@@ -665,17 +844,41 @@ async function runCompiler() {
         return B;
     }
 
-    // --- evaluate ---
+    const builtins = makeBuiltins(globalEnv, globalEnv);
+
+    // =========================================================
+    // EVALUATE
+    // =========================================================
     async function evaluate(expr, env) {
         if (typeof expr === 'string') {
             const s = expr.trim();
-            if (/^f["']/.test(s)) return await resolveFString(s, env);
+            if (RE_FSTRING_START.test(s)) return await resolveFString(s, env);
             expr = tokenize(s);
         }
         if (expr.length === 0) return wrap(null, 'None');
-        if (expr.length === 2 && expr[0] === 'f' && /^["']/.test(String(expr[1]))) {
+        if (expr.length === 2 && expr[0] === 'f' && RE_FSTRING_TOKEN.test(String(expr[1]))) {
             return await resolveFString('f' + expr[1], env);
         }
+
+        // single token fast path
+        if (expr.length === 1) {
+            const item = expr[0];
+            if (typeof item === 'object') return item;
+            if (item === 'True') return wrap(true, 'bool');
+            if (item === 'False') return wrap(false, 'bool');
+            if (item === 'None') return wrap(null, 'None');
+            if (RE_NAN_CHECK.test(item)) {
+                const n = parseFloat(item);
+                return wrap(n, Number.isInteger(n) ? 'int' : 'float');
+            }
+            if (item.startsWith('"""') || item.startsWith("'''")) return wrap(unescapeString(item.slice(3, -3)), 'str');
+            if (item.startsWith('"') || item.startsWith("'")) return wrap(unescapeString(item.slice(1, -1)), 'str');
+            if (RE_FSTRING_START.test(item)) return await resolveFString(item, env);
+            return env.get(item);
+        }
+
+        const methodChainResult = await tryMethodChain(expr, env);
+        if (methodChainResult !== null) return methodChainResult;
 
         for (let logicOp of ['or', 'and']) {
             let depth = 0;
@@ -698,44 +901,65 @@ async function runCompiler() {
             return wrap(!pyBool(val.value), 'bool');
         }
 
-        // --- resolve function calls ---
+        // resolve function calls
         let open;
         while ((open = expr.lastIndexOf('(')) !== -1) {
             let close = expr.indexOf(')', open);
             const inner = expr.slice(open + 1, close);
-            let args = []; let sub = []; let bal = 0;
-            for (let t of inner) {
-                if (t === '[' || t === '(') bal++; if (t === ']' || t === ')') bal--;
-                if (t === ',' && bal === 0) { args.push(await evaluate(sub, env)); sub = []; }
-                else sub.push(t);
-            }
-            if (sub.length > 0) args.push(await evaluate(sub, env));
+            let positionalArgs = [];
+            let kwargsMap = {};
 
-            if (open > 0 && /^[a-zA-Z_]\w*$/.test(expr[open - 1]) && !['+', '-', '*', '/', '%'].includes(expr[open - 1])) {
+            const allStrings = inner.every(t => typeof t === 'string');
+            if (allStrings) {
+                const innerRaw = inner.join(' ');
+                const parsed = await parseCallArgs(innerRaw, env);
+                positionalArgs = parsed.positional;
+                kwargsMap = parsed.kwargs;
+            } else {
+                let sub = [], bal = 0;
+                for (let t of inner) {
+                    if (typeof t === 'object') { positionalArgs.push(t); sub = []; continue; }
+                    if (t === '[' || t === '(') bal++; if (t === ']' || t === ')') bal--;
+                    if (t === ',' && bal === 0) { if (sub.length) { positionalArgs.push(await evaluate(sub, env)); sub = []; } }
+                    else sub.push(t);
+                }
+                if (sub.length > 0) positionalArgs.push(await evaluate(sub, env));
+            }
+
+            if (open > 0 && RE_IDENT_ONLY.test(expr[open - 1]) && !['+', '-', '*', '/', '%'].includes(expr[open - 1])) {
                 const funcName = expr[open - 1];
                 let res;
+                let fnObj = null;
+                try { fnObj = env.get(funcName); } catch(e) { /* not in env */ }
 
-                // --- lookup ---
-                const builtins = makeBuiltins(env, globalEnv);
-                if (funcName in builtins) {
-                    res = await builtins[funcName](args);
+                if (fnObj && (fnObj.type === 'func' || fnObj.type === 'builtin')) {
+                    // User defined a callable with this name
+                    res = await callFunction(fnObj, positionalArgs, env, kwargsMap);
+                } else if (funcName in builtins) {
+                    res = await builtins[funcName](positionalArgs);
+                } else if (fnObj) {
+                    // env has it but it's not callable
+                    throw new Error(`TypeError: '${funcName}' object is not callable`);
                 } else {
-                    // defs
-                    const fnObj = env.get(funcName);
-                    if (!fnObj || (fnObj.type !== 'func' && fnObj.type !== 'builtin')) throw new Error(`TypeError: '${funcName}' is not callable`);
-                    res = await callFunction(fnObj, args, env);
+                    throw new Error(`NameError: name '${funcName}' is not defined`);
                 }
                 expr.splice(open - 1, (close - open) + 2, res);
             } else {
-                expr.splice(open, (close - open) + 1, args[0] || wrap(null, 'None'));
+                expr.splice(open, (close - open) + 1, positionalArgs[0] || wrap(null, 'None'));
             }
         }
 
-        // --- list indexing ---
+        // list indexing and list literals
         let bOpen;
         while ((bOpen = expr.lastIndexOf('[')) !== -1) {
-            let bClose = expr.indexOf(']', bOpen);
-            if (bOpen > 0 && (/^[a-zA-Z_]\w*$/.test(expr[bOpen - 1]) || typeof expr[bOpen - 1] === 'object')) {
+            let bClose = -1, depth = 0;
+            for (let bi = bOpen; bi < expr.length; bi++) {
+                if (expr[bi] === '[') depth++;
+                else if (expr[bi] === ']') { depth--; if (depth === 0) { bClose = bi; break; } }
+            }
+            if (bClose === -1) break;
+
+            if (bOpen > 0 && (RE_IDENT_ONLY.test(expr[bOpen - 1]) || typeof expr[bOpen - 1] === 'object')) {
                 const target = await evaluate([expr[bOpen - 1]], env);
                 const idxExpr = expr.slice(bOpen + 1, bClose);
 
@@ -775,14 +999,86 @@ async function runCompiler() {
                     }
                 }
             } else {
-                let items = []; let sub = []; let bal = 0;
-                for (let t of expr.slice(bOpen + 1, bClose)) {
-                    if (t === '[' || t === '(') bal++; if (t === ']' || t === ')') bal--;
-                    if (t === ',' && bal === 0) { items.push((await evaluate(sub, env)).value); sub = []; }
-                    else sub.push(t);
+                const innerTokens = expr.slice(bOpen + 1, bClose);
+                const forIdx = innerTokens.indexOf('for');
+                if (forIdx > 0 && innerTokens.indexOf('in') > forIdx) {
+                    const valueTokens = innerTokens.slice(0, forIdx);
+                    const rest = innerTokens.slice(forIdx + 1);
+                    const inIdx = rest.indexOf('in');
+                    const varTokens = rest.slice(0, inIdx);
+                    const ifIdx = rest.indexOf('if');
+                    const iterTokens = ifIdx !== -1 ? rest.slice(inIdx + 1, ifIdx) : rest.slice(inIdx + 1);
+                    const condTokens = ifIdx !== -1 ? rest.slice(ifIdx + 1) : null;
+                    const iter = await evaluate(iterTokens, env);
+                    const vals = iterValues(iter.value);
+                    const items = [];
+                    for (const v of vals) {
+                        const varName = varTokens.join('').trim();
+                        env.set(varName, wrap(v, 'obj'));
+                        if (condTokens) {
+                            const cond = await evaluate(condTokens, env);
+                            if (!pyBool(cond.value)) continue;
+                        }
+                        const item = await evaluate(valueTokens, env);
+                        items.push(item.value);
+                    }
+                    expr.splice(bOpen, (bClose - bOpen) + 1, wrap(items, 'list'));
+                } else {
+                    let items = []; let sub = []; let bal = 0;
+                    for (let t of innerTokens) {
+                        if (t === '[' || t === '(') bal++;
+                        if (t === ']' || t === ')') bal--;
+                        if (t === ',' && bal === 0) { items.push((await evaluate(sub, env)).value); sub = []; }
+                        else sub.push(t);
+                    }
+                    if (sub.length > 0 && !(sub.length === 1 && sub[0] === '')) {
+                        items.push((await evaluate(sub, env)).value);
+                    }
+                    expr.splice(bOpen, (bClose - bOpen) + 1, wrap(items, 'list'));
                 }
-                if (sub.length > 0) items.push((await evaluate(sub, env)).value);
-                expr.splice(bOpen, (bClose - bOpen) + 1, wrap(items, 'list'));
+            }
+        }
+
+        // chained comparisons
+        {
+            const compOps = ['==', '!=', '<', '>', '<=', '>=', 'in'];
+            let compPositions = [];
+            let depth = 0;
+            for (let i = 0; i < expr.length; i++) {
+                if (expr[i] === '(' || expr[i] === '[') depth++;
+                else if (expr[i] === ')' || expr[i] === ']') depth--;
+                else if (depth === 0 && compOps.includes(expr[i])) {
+                    if (expr[i] === 'in' && i > 0 && expr[i-1] === 'not') continue;
+                    compPositions.push(i);
+                }
+            }
+            if (compPositions.length >= 2) {
+                let result = true;
+                let prevVal = await evaluate(expr.slice(0, compPositions[0]), env);
+                for (let ci = 0; ci < compPositions.length; ci++) {
+                    const opIdx = compPositions[ci];
+                    const nextEnd = ci + 1 < compPositions.length ? compPositions[ci + 1] : expr.length;
+                    let op = expr[opIdx];
+                    let nextStart = opIdx + 1;
+                    if (op === 'in' && opIdx > 0 && expr[opIdx - 1] === 'not') { op = 'not in'; }
+                    const nextVal = await evaluate(expr.slice(nextStart, nextEnd), env);
+                    let pairTrue;
+                    if (op === '==') pairTrue = prevVal.value == nextVal.value;
+                    else if (op === '!=') pairTrue = prevVal.value != nextVal.value;
+                    else if (op === '<') pairTrue = prevVal.value < nextVal.value;
+                    else if (op === '>') pairTrue = prevVal.value > nextVal.value;
+                    else if (op === '<=') pairTrue = prevVal.value <= nextVal.value;
+                    else if (op === '>=') pairTrue = prevVal.value >= nextVal.value;
+                    else if (op === 'in') {
+                        const rv = nextVal.value;
+                        if (Array.isArray(rv)) pairTrue = rv.includes(prevVal.value);
+                        else if (typeof rv === 'string') pairTrue = rv.includes(prevVal.value);
+                        else pairTrue = false;
+                    }
+                    if (!pairTrue) { result = false; break; }
+                    prevVal = nextVal;
+                }
+                return wrap(result, 'bool');
             }
         }
 
@@ -791,13 +1087,23 @@ async function runCompiler() {
             for (let i = expr.length - 1; i > 0; i--) {
                 if (group.includes(expr[i])) {
                     if (expr[i] === '-' && (i === 0 || ops.flat().includes(expr[i - 1]))) continue;
-                    if (expr[i] === 'not') continue;
+                    if (expr[i] === 'not') {
+                        const val = await evaluate(expr.slice(i + 1), env);
+                        const negated = wrap(!pyBool(val.value), 'bool');
+                        expr.splice(i, expr.length - i, negated);
+                        break;
+                    }
+                    if (expr[i] === 'in' && i > 0 && expr[i - 1] === 'not') continue;
                     const left = await evaluate(expr.slice(0, i), env);
                     const right = await evaluate(expr.slice(i + 1), env);
                     let v;
                     if (expr[i] === '+') v = (Array.isArray(left.value) && Array.isArray(right.value)) ? [...left.value, ...right.value] : left.value + right.value;
                     else if (expr[i] === '-') v = left.value - right.value;
-                    else if (expr[i] === '*') v = left.value * right.value;
+                    else if (expr[i] === '*') {
+                        if (typeof left.value === 'string' && typeof right.value === 'number') v = left.value.repeat(Math.floor(right.value));
+                        else if (typeof right.value === 'string' && typeof left.value === 'number') v = right.value.repeat(Math.floor(left.value));
+                        else v = left.value * right.value;
+                    }
                     else if (expr[i] === '/') v = left.value / right.value;
                     else if (expr[i] === '//') v = Math.floor(left.value / right.value);
                     else if (expr[i] === '%') v = ((left.value % right.value) + right.value) % right.value;
@@ -817,10 +1123,35 @@ async function runCompiler() {
                     }
                     return wrap(v, 'obj');
                 }
+                if (expr[i] === 'in' && i > 1 && expr[i - 1] === 'not') {
+                    const left = await evaluate(expr.slice(0, i - 1), env);
+                    const right = await evaluate(expr.slice(i + 1), env);
+                    const rv = right.value;
+                    let inResult;
+                    if (Array.isArray(rv)) inResult = rv.includes(left.value);
+                    else if (typeof rv === 'string') inResult = rv.includes(left.value);
+                    else if (rv?.__type__ === 'dict') inResult = left.value in rv.data;
+                    else if (rv?.__type__ === 'set' || rv?.__type__ === 'frozenset') inResult = rv.data.has(left.value);
+                    else inResult = false;
+                    return wrap(!inResult, 'bool');
+                }
             }
         }
 
         if (expr[0] === '-') return wrap(-(await evaluate(expr.slice(1), env)).value, 'int');
+
+        if (Array.isArray(expr) && expr.some(t => t === ',')) {
+            let parts = []; let sub = []; let depth = 0;
+            for (const t of expr) {
+                if (t === '(' || t === '[') { depth++; sub.push(t); }
+                else if (t === ')' || t === ']') { depth--; sub.push(t); }
+                else if (t === ',' && depth === 0) { parts.push((await evaluate(sub, env)).value); sub = []; }
+                else sub.push(t);
+            }
+            if (sub.length) parts.push((await evaluate(sub, env)).value);
+            return wrap({ __type__: 'tuple', data: parts }, 'tuple');
+        }
+
         const item = expr[0];
         if (typeof item === 'object') return item;
         if (item === 'True') return wrap(true, 'bool');
@@ -830,10 +1161,50 @@ async function runCompiler() {
             const n = parseFloat(item);
             return wrap(n, Number.isInteger(n) ? 'int' : 'float');
         }
-        if (item.startsWith('"') || item.startsWith("'")) return wrap(item.slice(1, -1), 'str');
+        if (item.startsWith('"""') || item.startsWith("'''")) return wrap(unescapeString(item.slice(3, -3)), 'str');
+        if (item.startsWith('"') || item.startsWith("'")) return wrap(unescapeString(item.slice(1, -1)), 'str');
         return env.get(item);
     }
 
+    // --- obj.method(...) ---
+    async function tryMethodChain(tokens, env) {
+        const s = tokens;
+        if (s.length < 4) return null;
+
+        let depth = 0;
+        let dotIdx = -1;
+        for (let i = 0; i < s.length; i++) {
+            if (s[i] === '(' || s[i] === '[') depth++;
+            else if (s[i] === ')' || s[i] === ']') depth--;
+            else if (s[i] === '.' && depth === 0) dotIdx = i;
+        }
+        if (dotIdx === -1 || dotIdx === 0) return null;
+        if (dotIdx + 3 > s.length) return null;
+        const methodName = s[dotIdx + 1];
+        if (typeof methodName !== 'string' || !RE_IDENT_ONLY.test(methodName)) return null;
+        if (s[dotIdx + 2] !== '(') return null;
+        let closeIdx = -1, d = 0;
+        for (let i = dotIdx + 2; i < s.length; i++) {
+            if (s[i] === '(') d++;
+            else if (s[i] === ')') { d--; if (d === 0) { closeIdx = i; break; } }
+        }
+        if (closeIdx === -1 || closeIdx !== s.length - 1) return null;
+
+        const base = await evaluate(s.slice(0, dotIdx), env);
+        const argsTokens = s.slice(dotIdx + 3, closeIdx);
+        const argsRaw = argsTokens.join(' ');
+        let mArgs = [];
+        if (argsRaw.trim()) {
+            const parsed = await parseCallArgs(argsRaw, env);
+            mArgs = parsed.positional;
+        }
+
+        const result = await dispatchMethod(base, methodName, mArgs, env, '__expr__');
+        if (result === undefined) return wrap(null, 'None');
+        return result;
+    }
+
+    // --- indents ---
     function collectBlock(lines, startIdx, headerIndent) {
         const body = [];
         let j = startIdx;
@@ -841,28 +1212,166 @@ async function runCompiler() {
             const raw = lines[j];
             const rawText = raw.toString();
             if (rawText.trim() === '') { body.push(raw); j++; continue; }
-            const lineIndent = rawText.match(/^(\s*)/)[0].length;
+            const lineIndent = rawText.match(RE_INDENT)[0].length;
             if (lineIndent > headerIndent) { body.push(raw); j++; }
             else break;
         }
         return { body, next: j };
     }
 
-    // Tag strings with line num
+    // --- wrap source line string with original line number ---
     function tagLine(text, srcLine) {
         const t = new String(text);
         t.__srcLine = srcLine;
         return t;
     }
 
+    // =========================================================
+    // PREPROCESS
+    // =========================================================
+    function preprocessSource(src) {
+        const lines = [];
+        let i = 0;
+        let lineNum = 1;
+        let curLine = '';
+
+        while (i < src.length) {
+            // skip comments
+            if (src[i] === '#') {
+                while (i < src.length && src[i] !== '\n') i++;
+                continue;
+            }
+
+            // triple-quoted strings
+            if ((src[i] === '"' || src[i] === "'") && src[i+1] === src[i] && src[i+2] === src[i]) {
+                const q = src[i];
+                const tripleQ = q + q + q;
+                let token = tripleQ;
+                i += 3;
+                while (i < src.length) {
+                    if (src[i] === q && src[i+1] === q && src[i+2] === q) { token += tripleQ; i += 3; break; }
+                    if (src[i] === '\n') { token += '\\n'; i++; }
+                    else if (src[i] === '\\') { token += src[i] + (src[i+1] || ''); i += 2; }
+                    else { token += src[i++]; }
+                }
+                curLine += token;
+                continue;
+            }
+
+            // f-strings
+            if ((src[i] === 'f' || src[i] === 'F') && (src[i+1] === '"' || src[i+1] === "'")) {
+                const q = src[i+1];
+                curLine += src[i]; i++;
+                if (src[i+1] === q && src[i+2] === q) {
+                    curLine += q + q + q; i += 3;
+                    while (i < src.length) {
+                        if (src[i] === q && src[i+1] === q && src[i+2] === q) { curLine += q + q + q; i += 3; break; }
+                        if (src[i] === '\n') { curLine += '\\n'; i++; }
+                        else if (src[i] === '\\') { curLine += src[i] + (src[i+1]||''); i += 2; }
+                        else curLine += src[i++];
+                    }
+                    continue;
+                }
+                curLine += q; i++;
+                while (i < src.length && src[i] !== q) {
+                    if (src[i] === '\\') { curLine += src[i] + (src[i+1]||''); i += 2; }
+                    else curLine += src[i++];
+                }
+                curLine += q; i++;
+                continue;
+            }
+
+            // regular strings
+            if (src[i] === '"' || src[i] === "'") {
+                const q = src[i];
+                curLine += q; i++;
+                while (i < src.length && src[i] !== q) {
+                    if (src[i] === '\\') { curLine += src[i] + (src[i+1]||''); i += 2; }
+                    else curLine += src[i++];
+                }
+                curLine += q; i++;
+                continue;
+            }
+
+            if (src[i] === '\n') {
+                lines.push(tagLine(curLine, lineNum++));
+                curLine = '';
+                i++;
+                continue;
+            }
+
+            curLine += src[i++];
+        }
+        if (curLine) lines.push(tagLine(curLine, lineNum));
+
+        // second pass
+        for (let li = 0; li < lines.length; li++) {
+            const raw = lines[li].toString();
+            let stripped = '', inS = false, sC = '', tri = false;
+            for (let k = 0; k < raw.length; k++) {
+                const c = raw[k];
+                if (inS) {
+                    stripped += c;
+                    if (tri && c === sC && raw[k+1] === sC && raw[k+2] === sC) { stripped += raw[k+1]+raw[k+2]; k+=2; inS=false; }
+                    else if (!tri && c === sC) inS = false;
+                } else if ((c==='"'||c==="'") && raw[k+1]===c && raw[k+2]===c) { inS=true; tri=true; sC=c; stripped+=c+c+c; k+=2; }
+                else if (c==='"'||c==="'") { inS=true; tri=false; sC=c; stripped+=c; }
+                else if (c==='#') break;
+                else stripped+=c;
+            }
+            const t = new String(stripped);
+            t.__srcLine = lines[li].__srcLine;
+            lines[li] = t;
+        }
+
+        // third pass
+        const merged = [];
+        let ci = 0;
+        while (ci < lines.length) {
+            let text = lines[ci].toString();
+            const srcLine = lines[ci].__srcLine;
+            let depth = 0, inS = false, sC = '';
+            for (let k = 0; k < text.length; k++) {
+                const c = text[k];
+                if (inS) { if (c === sC) inS = false; continue; }
+                if (c === '"' || c === "'") { inS = true; sC = c; continue; }
+                if (c === '(' || c === '[') depth++;
+                else if (c === ')' || c === ']') depth--;
+            }
+            const explicitContinue = text.trimEnd().endsWith('\\');
+            if (explicitContinue) text = text.trimEnd().slice(0, -1);
+            while ((depth > 0 || explicitContinue) && ci + 1 < lines.length) {
+                ci++;
+                const nextText = lines[ci].toString().trim();
+                text = text + ' ' + nextText;
+                depth = 0; inS = false; sC = '';
+                for (let k = 0; k < text.length; k++) {
+                    const c = text[k];
+                    if (inS) { if (c === sC) inS = false; continue; }
+                    if (c === '"' || c === "'") { inS = true; sC = c; continue; }
+                    if (c === '(' || c === '[') depth++;
+                    else if (c === ')' || c === ']') depth--;
+                }
+                if (text.trimEnd().endsWith('\\')) text = text.trimEnd().slice(0, -1);
+                else if (depth <= 0) break;
+            }
+            merged.push(tagLine(text, srcLine));
+            ci++;
+        }
+        return merged;
+    }
+
+    // =========================================================
+    // EXECUTE BLOCK
+    // =========================================================
     async function executeBlock(lines, env, lineOffset = 1) {
-        // Expand semicolons
+        // expand semicolon-separated statements onto individual lines
         const expanded = [];
         for (let ri = 0; ri < lines.length; ri++) {
             const raw = lines[ri];
             const srcLine = raw.__srcLine ?? (lineOffset + ri);
             const rawText = raw.toString();
-            const indentStr = rawText.match(/^(\s*)/)[0];
+            const indentStr = rawText.match(RE_INDENT)[0];
 
             let cur = '', inStr = false, strChar = '';
             const stmts = [];
@@ -887,27 +1396,38 @@ async function runCompiler() {
             const srcLine = raw.__srcLine;
             const rawText = raw.toString();
 
-            // Strip inline comments
-            let stripped = '', inS = false, sC = '';
+            let stripped = '', inS = false, sC = '', tripleMode = false;
             for (let ci = 0; ci < rawText.length; ci++) {
                 const c = rawText[ci];
-                if (inS) { stripped += c; if (c === sC) inS = false; }
-                else if (c === '"' || c === "'") { inS = true; sC = c; stripped += c; }
+                if (inS) {
+                    stripped += c;
+                    if (tripleMode && c === sC && rawText[ci+1] === sC && rawText[ci+2] === sC) {
+                        stripped += rawText[ci+1] + rawText[ci+2]; ci += 2; inS = false;
+                    } else if (!tripleMode && c === sC) inS = false;
+                } else if ((c === '"' || c === "'") && rawText[ci+1] === c && rawText[ci+2] === c) {
+                    inS = true; tripleMode = true; sC = c;
+                    stripped += c + c + c; ci += 2;
+                } else if (c === '"' || c === "'") { inS = true; tripleMode = false; sC = c; stripped += c; }
                 else if (c === '#') break;
                 else stripped += c;
             }
 
             if (!stripped.trim()) { i++; continue; }
             const trimmed = stripped.trim();
-            const indent = stripped.match(/^(\s*)/)[0].length;
+            const indent = stripped.match(RE_INDENT)[0].length;
 
-            // Inline block expansion
+            // expand single-line blocks
             const colonIdx = (() => {
-                let depth = 0, inS = false, sc = '';
+                let depth = 0, inS = false, sc = '', tri = false;
                 for (let ci = 0; ci < trimmed.length; ci++) {
                     const c = trimmed[ci];
-                    if (inS) { if (c === sc) inS = false; continue; }
-                    if (c === '"' || c === "'") { inS = true; sc = c; continue; }
+                    if (inS) {
+                        if (tri && c === sc && trimmed[ci+1] === sc && trimmed[ci+2] === sc) { ci += 2; inS = false; }
+                        else if (!tri && c === sc) inS = false;
+                        continue;
+                    }
+                    if ((c === '"' || c === "'") && trimmed[ci+1] === c && trimmed[ci+2] === c) { inS = true; tri = true; sc = c; ci += 2; continue; }
+                    if (c === '"' || c === "'") { inS = true; tri = false; sc = c; continue; }
                     if (c === '(' || c === '[') depth++;
                     else if (c === ')' || c === ']') depth--;
                     else if (c === ':' && depth === 0) return ci;
@@ -915,8 +1435,7 @@ async function runCompiler() {
                 return -1;
             })();
 
-            const blockHeaderRe = /^(if |elif |else\s*:|for |while |def )/;
-            if (blockHeaderRe.test(trimmed) && colonIdx !== -1) {
+            if (RE_BLOCK_HEADER.test(trimmed) && colonIdx !== -1) {
                 const afterColon = trimmed.slice(colonIdx + 1).trim();
                 if (afterColon) {
                     const header = tagLine(' '.repeat(indent) + trimmed.slice(0, colonIdx + 1), srcLine);
@@ -927,20 +1446,29 @@ async function runCompiler() {
             }
 
             try {
-                // --- global ---
-                if (trimmed.match(/^global\s+/)) {
+                if (RE_GLOBAL.test(trimmed)) {
                     trimmed.slice(7).split(',').map(n => n.trim()).forEach(n => globalVars.add(n));
                     i++; continue;
                 }
 
-                // --- nonlocal ---
-                if (trimmed.match(/^nonlocal\s+/)) {
+                if (RE_NONLOCAL.test(trimmed)) {
                     trimmed.slice(9).split(',').map(n => n.trim()).forEach(n => nonlocalVars.add(n));
                     i++; continue;
                 }
 
-                // --- assignment ---
-                const assignMatch = trimmed.match(/^([a-zA-Z_]\w*(?:\[.*?\])?)\s*(\+|-)?=(?!=)\s*(.*)$/);
+                const tupleAssignMatch = trimmed.match(RE_TUPLE_ASSIGN);
+                if (tupleAssignMatch) {
+                    const names = tupleAssignMatch[1].split(',').map(n => n.trim());
+                    const rhs = await evaluate(tupleAssignMatch[2], env);
+                    let items;
+                    if (rhs.value && rhs.value.__type__ === 'tuple') items = rhs.value.data;
+                    else if (Array.isArray(rhs.value)) items = rhs.value;
+                    else items = iterValues(rhs.value);
+                    names.forEach((n, idx) => env.set(n, wrap(items[idx] ?? null, 'obj')));
+                    i++; continue;
+                }
+
+                const assignMatch = trimmed.match(RE_ASSIGN);
                 if (assignMatch) {
                     const target = assignMatch[1].trim();
                     const newVal = await evaluate(assignMatch[3], env);
@@ -958,6 +1486,9 @@ async function runCompiler() {
                         const augOp = assignMatch[2];
                         const doAug = (curr, newV, op) => {
                             if (op === '+') return (Array.isArray(curr) && Array.isArray(newV)) ? [...curr, ...newV] : curr + newV;
+                            if (op === '-') return curr - newV;
+                            if (op === '*') return curr * newV;
+                            if (op === '/') return curr / newV;
                             return curr - newV;
                         };
                         if (globalVars.has(baseName)) {
@@ -974,16 +1505,14 @@ async function runCompiler() {
                     i++; continue;
                 }
 
-                // --- return ---
-                if (trimmed.startsWith('return')) {
+                if (RE_RETURN.test(trimmed)) {
                     const retExpr = trimmed.slice(6).trim();
                     const retTyped = retExpr ? await evaluate(retExpr, env) : wrap(null, 'None');
                     throw { __return__: true, value: retTyped.value, typedResult: retTyped };
                 }
 
-                // --- def ---
-                if (trimmed.match(/^def\s+[a-zA-Z_]\w*\s*\(.*\)\s*:$/)) {
-                    const m = trimmed.match(/^def\s+([a-zA-Z_]\w*)\s*\((.*)\)\s*:$/);
+                if (RE_DEF.test(trimmed)) {
+                    const m = trimmed.match(RE_DEF_PARTS);
                     const name = m[1];
                     const params = parseParams(m[2]);
                     const { body: fnBody, next } = collectBlock(lines, i + 1, indent);
@@ -991,32 +1520,37 @@ async function runCompiler() {
                     i = next; continue;
                 }
 
-                // --- print ---
+                // print fast-path
                 if (trimmed.startsWith('print(')) {
-                    const content = trimmed.match(/^print\((.*)\)$/)[1];
-                    let args = []; let sub = []; let bal = 0; let inStr = false;
-                    for (let c of content) {
-                        if (c === '"' || c === "'") inStr = !inStr;
-                        if (c === '(' || c === '[') bal++; if (c === ')' || c === ']') bal--;
-                        if (c === ',' && bal === 0 && !inStr) { args.push(await evaluate(sub.join(''), env)); sub = []; }
-                        else sub.push(c);
+                    let printShadowed = false;
+                    try { const p = env.get('print'); if (p && p.type === 'func') printShadowed = true; } catch(e) {}
+                    if (!printShadowed) {
+                        const content = trimmed.match(/^print\((.*)\)$/s)?.[1];
+                        if (content !== undefined) {
+                            let args = []; let sub = []; let bal = 0; let inStr = false;
+                            for (let c of content) {
+                                if (c === '"' || c === "'") inStr = !inStr;
+                                if (c === '(' || c === '[') bal++; if (c === ')' || c === ']') bal--;
+                                if (c === ',' && bal === 0 && !inStr) { args.push(await evaluate(sub.join(''), env)); sub = []; }
+                                else sub.push(c);
+                            }
+                            if (sub.length) args.push(await evaluate(sub.join(''), env));
+                            outputToConsole(args.map(a => a.value));
+                            i++; continue;
+                        }
                     }
-                    if (sub.length) args.push(await evaluate(sub.join(''), env));
-                    outputToConsole(args.map(a => a.value));
-                    i++; continue;
                 }
 
-                // --- if/elif/else ---
-                if (trimmed.match(/^if .+:$/)) {
+                if (RE_IF.test(trimmed)) {
                     let k = i;
                     let executed = false;
                     while (k < lines.length) {
                         const curRaw = lines[k];
                         if (!curRaw.toString().trim()) { k++; continue; }
-                        const curIndent = curRaw.toString().match(/^(\s*)/)[0].length;
+                        const curIndent = curRaw.toString().match(RE_INDENT)[0].length;
                         if (curIndent !== indent && k !== i) break;
                         const curTrimmed = curRaw.toString().trim();
-                        const m = curTrimmed.match(/^(if|elif|else)\s*(.*?):$/);
+                        const m = curTrimmed.match(RE_IF_CHAIN);
                         if (!m) break;
                         const { body, next } = collectBlock(lines, k + 1, indent);
                         if (!executed) {
@@ -1030,7 +1564,7 @@ async function runCompiler() {
                         let peek = k;
                         while (peek < lines.length && !lines[peek].toString().trim()) peek++;
                         if (peek >= lines.length) break;
-                        const peekIndent = lines[peek].toString().match(/^(\s*)/)[0].length;
+                        const peekIndent = lines[peek].toString().match(RE_INDENT)[0].length;
                         if (peekIndent !== indent) break;
                         if (!lines[peek].toString().trim().match(/^(elif|else)/)) break;
                         k = peek;
@@ -1038,15 +1572,16 @@ async function runCompiler() {
                     i = k; continue;
                 }
 
-                // --- for / while ---
-                if (trimmed.startsWith('for ') || trimmed.startsWith('while ')) {
+                if (trimmed === 'break') throw { __break__: true };
+                if (trimmed === 'continue') throw { __continue__: true };
+
+                if (RE_FOR_WHILE.test(trimmed)) {
                     const { body, next } = collectBlock(lines, i + 1, indent);
                     if (trimmed.startsWith('for ')) {
-                        const m = trimmed.match(/^for\s+(.+)\s+in\s+(.+):$/);
+                        const m = trimmed.match(RE_FOR_PARTS);
                         const iter = await evaluate(m[2], env);
                         const vals = iterValues(iter.value);
-                        for (let v of vals) {
-                            // Tuple unpacking
+                        outer: for (let v of vals) {
                             const varPart = m[1].trim();
                             if (varPart.includes(',')) {
                                 const names = varPart.split(',').map(n => n.trim());
@@ -1055,46 +1590,53 @@ async function runCompiler() {
                             } else {
                                 env.set(varPart, wrap(v, 'obj'));
                             }
-                            await executeBlock(body, env, srcLine);
+                            try { await executeBlock(body, env, srcLine); }
+                            catch (e) {
+                                if (e && e.__break__) break outer;
+                                if (e && e.__continue__) continue outer;
+                                throw e;
+                            }
                         }
                     } else {
-                        const cond = trimmed.match(/^while\s+(.+):$/)[1];
-                        while (pyBool((await evaluate(cond, env)).value)) await executeBlock(body, env, srcLine);
+                        const cond = trimmed.match(RE_WHILE_COND)[1];
+                        let _whileIter = 0;
+                        outer: while (pyBool((await evaluate(cond, env)).value)) {
+                            try { await executeBlock(body, env, srcLine); }
+                            catch (e) {
+                                if (e && e.__break__) break outer;
+                                if (e && e.__continue__) {}
+                                else throw e;
+                            }
+                            if (++_whileIter % 1000 === 0) await new Promise(r => setTimeout(r, 0));
+                        }
                     }
                     i = next; continue;
                 }
 
-                // --- standalone call ---
-                if (/^[a-zA-Z_]\w*\s*\(/.test(trimmed)) {
+                if (RE_DOT_ACCESS.test(trimmed) || RE_FUNC_CALL.test(trimmed)) {
                     await evaluate(trimmed, env);
                     i++; continue;
                 }
 
-                // --- method calls ---
-                const methodMatch = trimmed.match(/^([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\((.*)\)$/);
+                const methodMatch = trimmed.match(RE_METHOD_CALL);
                 if (methodMatch) {
                     const [, objName, method, argsRaw] = methodMatch;
                     const obj = env.get(objName);
-                    let mArgs = [];
-                    if (argsRaw.trim()) {
-                        let sub = [], bal = 0, inStr = false;
-                        for (const c of argsRaw) {
-                            if (c === '"' || c === "'") inStr = !inStr;
-                            if (!inStr && (c === '(' || c === '[')) bal++;
-                            if (!inStr && (c === ')' || c === ']')) bal--;
-                            if (c === ',' && bal === 0 && !inStr) { mArgs.push(await evaluate(sub.join(''), env)); sub = []; }
-                            else sub.push(c);
-                        }
-                        if (sub.length) mArgs.push(await evaluate(sub.join(''), env));
-                    }
-                    await dispatchMethod(obj, method, mArgs, env, objName);
+                    const parsed = await parseCallArgs(argsRaw, env);
+                    await dispatchMethod(obj, method, parsed.positional, env, objName);
                     i++; continue;
                 }
 
+                await evaluate(trimmed, env);
+
             } catch (e) {
-                if (e && e.__return__) throw e;
-                outputToConsole(`ERROR on line ${srcLine}: ${e.message}`);
-                return;
+                if (e && (e.__return__ || e.__break__ || e.__continue__ || e.__halt__)) throw e;
+                // --- Traceback ---
+                const lineText = stripped;
+                const tb = formatTraceback(srcLine, lineText, e.message ?? String(e));
+                outputToConsole(tb);
+                console.error(`Pyrite line ${srcLine}:`, e);
+                throw { __halt__: true };
             }
             i++;
         }
@@ -1106,14 +1648,14 @@ async function runCompiler() {
 
         // LIST methods
         if (Array.isArray(v)) {
-            if (method === 'append') { v.push(args[0].value); return; }
-            if (method === 'extend') { v.push(...iterValues(args[0].value)); return; }
-            if (method === 'insert') { v.splice(args[0].value, 0, args[1].value); return; }
-            if (method === 'pop') { const idx = args[0]?.value ?? -1; const fi = idx < 0 ? v.length + idx : idx; v.splice(fi, 1); return; }
-            if (method === 'remove') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: value not in list'); v.splice(idx, 1); return; }
-            if (method === 'clear') { v.length = 0; return; }
-            if (method === 'reverse') { v.reverse(); return; }
-            if (method === 'sort') { v.sort((a, b) => a < b ? -1 : a > b ? 1 : 0); return; }
+            if (method === 'append') { v.push(args[0].value); return wrap(null, 'None'); }
+            if (method === 'extend') { v.push(...iterValues(args[0].value)); return wrap(null, 'None'); }
+            if (method === 'insert') { v.splice(args[0].value, 0, args[1].value); return wrap(null, 'None'); }
+            if (method === 'pop') { const idx = args[0]?.value ?? -1; const fi = idx < 0 ? v.length + idx : idx; const removed = v.splice(fi, 1); return wrap(removed[0], 'obj'); }
+            if (method === 'remove') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: value not in list'); v.splice(idx, 1); return wrap(null, 'None'); }
+            if (method === 'clear') { v.length = 0; return wrap(null, 'None'); }
+            if (method === 'reverse') { v.reverse(); return wrap(null, 'None'); }
+            if (method === 'sort') { v.sort((a, b) => a < b ? -1 : a > b ? 1 : 0); return wrap(null, 'None'); }
             if (method === 'index') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: value not in list'); return wrap(idx, 'int'); }
             if (method === 'count') { return wrap(v.filter(x => x === args[0].value).length, 'int'); }
             if (method === 'copy') { return wrap([...v], 'list'); }
@@ -1125,26 +1667,26 @@ async function runCompiler() {
             if (method === 'keys') { return wrap(Object.keys(v.data).map(k => isNaN(k) ? k : Number(k)), 'list'); }
             if (method === 'values') { return wrap(Object.values(v.data), 'list'); }
             if (method === 'items') { return wrap(Object.entries(v.data).map(([k, val]) => ({ __type__: 'tuple', data: [isNaN(k) ? k : Number(k), val] })), 'list'); }
-            if (method === 'update') { Object.assign(v.data, args[0].value?.data ?? {}); return; }
+            if (method === 'update') { Object.assign(v.data, args[0].value?.data ?? {}); return wrap(null, 'None'); }
             if (method === 'pop') { const r = v.data[args[0].value]; delete v.data[args[0].value]; return wrap(r, 'obj'); }
-            if (method === 'clear') { for (const k in v.data) delete v.data[k]; return; }
+            if (method === 'clear') { for (const k in v.data) delete v.data[k]; return wrap(null, 'None'); }
             if (method === 'setdefault') { if (!(args[0].value in v.data)) v.data[args[0].value] = args[1]?.value ?? null; return wrap(v.data[args[0].value], 'obj'); }
             if (method === 'copy') { return wrap({ __type__: 'dict', data: { ...v.data } }, 'dict'); }
         }
 
         // SET methods
         if (v?.__type__ === 'set') {
-            if (method === 'add') { v.data.add(args[0].value); return; }
-            if (method === 'remove') { if (!v.data.has(args[0].value)) throw new Error('KeyError'); v.data.delete(args[0].value); return; }
-            if (method === 'discard') { v.data.delete(args[0].value); return; }
+            if (method === 'add') { v.data.add(args[0].value); return wrap(null, 'None'); }
+            if (method === 'remove') { if (!v.data.has(args[0].value)) throw new Error('KeyError'); v.data.delete(args[0].value); return wrap(null, 'None'); }
+            if (method === 'discard') { v.data.delete(args[0].value); return wrap(null, 'None'); }
             if (method === 'pop') { const first = [...v.data][0]; v.data.delete(first); return wrap(first, 'obj'); }
-            if (method === 'clear') { v.data.clear(); return; }
+            if (method === 'clear') { v.data.clear(); return wrap(null, 'None'); }
             if (method === 'union') { return wrap({ __type__: 'set', data: new Set([...v.data, ...args[0].value.data]) }, 'set'); }
             if (method === 'intersection') { return wrap({ __type__: 'set', data: new Set([...v.data].filter(x => args[0].value.data.has(x))) }, 'set'); }
             if (method === 'difference') { return wrap({ __type__: 'set', data: new Set([...v.data].filter(x => !args[0].value.data.has(x))) }, 'set'); }
             if (method === 'issubset') { return wrap([...v.data].every(x => args[0].value.data.has(x)), 'bool'); }
             if (method === 'issuperset') { return wrap([...args[0].value.data].every(x => v.data.has(x)), 'bool'); }
-            if (method === 'update') { for (const x of iterValues(args[0].value)) v.data.add(x); return; }
+            if (method === 'update') { for (const x of iterValues(args[0].value)) v.data.add(x); return wrap(null, 'None'); }
             if (method === 'copy') { return wrap({ __type__: 'set', data: new Set(v.data) }, 'set'); }
         }
 
@@ -1200,8 +1742,20 @@ async function runCompiler() {
         throw new Error(`AttributeError: '${obj.type}' object has no attribute '${method}'`);
     }
 
-    const sourceLines = code.split('\n').map((text, idx) => tagLine(text, idx + 1));
-    await executeBlock(sourceLines, globalEnv, 1);
+    const typeNames = ['int','float','str','bool','list','dict','tuple','set','frozenset','bytes','complex','object'];
+    for (const tn of typeNames) {
+        globalEnv.set(tn, { value: { __typeName__: tn }, type: 'type' });
+    }
+
+    const sourceLines = preprocessSource(code);
+    try {
+        await executeBlock(sourceLines, globalEnv, 1);
+    } catch (e) {
+        if (!e || !e.__halt__) {
+            outputToConsole(`FATAL: ${e?.message ?? e}`);
+            console.error('FATAL:', e);
+        }
+    }
 }
 
-console.log("Powered by JSthon v1.1.0");
+console.log("Powered by Pyrite v2.0.0");
