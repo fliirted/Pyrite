@@ -2,6 +2,8 @@
 
 Pyrite is a lightweight Python interpreter written in JavaScript that runs directly in the browser. It features a custom lexical tokenizer and an environment-based scoping system to mimic Python's execution model.
 
+**Try it yourself:** [Launch my demo](https://fliirted.github.io/tryme.html) and experiment with Pyrite instantly.
+
 ### Quick Start
 
 Integrate Pyrite into any web project with just a few lines of HTML:
